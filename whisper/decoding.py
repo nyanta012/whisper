@@ -96,6 +96,9 @@ class DecodingOptions:
     without_timestamps: bool = False              # use <|notimestamps|> to sample text tokens only
     max_initial_timestamp: Optional[float] = 1.0  # the initial timestamp cannot be later than this
 
+    # segment length
+    segment_length_ratio : Optional[float] = 1.0
+
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
@@ -400,11 +403,13 @@ class SuppressTokens(LogitFilter):
 
 class ApplyTimestampRules(LogitFilter):
     def __init__(
-        self, tokenizer: Tokenizer, sample_begin: int, max_initial_timestamp_index: Optional[int]
+        self, tokenizer: Tokenizer, sample_begin: int, max_initial_timestamp_index: Optional[int],
+        segment_length_ratio: Optional[float]
     ):
         self.tokenizer = tokenizer
         self.sample_begin = sample_begin
         self.max_initial_timestamp_index = max_initial_timestamp_index
+        self.segment_length_ratio = segment_length_ratio
 
     def apply(self, logits: Tensor, tokens: Tensor):
         # suppress <|notimestamps|> which is handled by without_timestamps
@@ -437,7 +442,7 @@ class ApplyTimestampRules(LogitFilter):
         for k in range(tokens.shape[0]):
             timestamp_logprob = logprobs[k, self.tokenizer.timestamp_begin :].logsumexp(dim=-1)
             max_text_token_logprob = logprobs[k, : self.tokenizer.timestamp_begin].max()
-            if timestamp_logprob > max_text_token_logprob:
+            if timestamp_logprob*self.segment_length_ratio > max_text_token_logprob:
                 logits[k, : self.tokenizer.timestamp_begin] = -np.inf
 
 
@@ -454,6 +459,8 @@ class DecodingTask:
         tokenizer = get_tokenizer(model.is_multilingual, language=language, task=options.task)
         self.tokenizer: Tokenizer = tokenizer
         self.options: DecodingOptions = self._verify_options(options)
+
+        self.segment_length_ratio = options.segment_length_ratio
 
         self.n_group: int = options.beam_size or options.best_of or 1
         self.n_ctx: int = model.dims.n_text_ctx
@@ -493,7 +500,7 @@ class DecodingTask:
             if options.max_initial_timestamp:
                 max_initial_timestamp_index = round(self.options.max_initial_timestamp / precision)
             self.logit_filters.append(
-                ApplyTimestampRules(tokenizer, self.sample_begin, max_initial_timestamp_index)
+                ApplyTimestampRules(tokenizer, self.sample_begin, max_initial_timestamp_index, self.segment_length_ratio)
             )
 
     def _verify_options(self, options: DecodingOptions) -> DecodingOptions:
